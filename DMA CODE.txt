@@ -1,0 +1,154 @@
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/dma.h>
+#include <zephyr/sys/printk.h>
+#include <inttypes.h>
+#include <stm32f7xx.h>
+
+#define ADC_NODE DT_ALIAS(adc0)
+static const struct device *adc_dev = DEVICE_DT_GET(ADC_NODE);
+
+#define DMA_NODE DT_NODELABEL(dma2)
+static const struct device *dma_dev;
+
+#define ADC_RESOLUTION 12
+#define BUFFER_SIZE    19964
+#define VREF_MV        1650
+
+/* DMA buffer (must be aligned) */
+static __aligned(4) int16_t dma_buffer[BUFFER_SIZE];
+
+/* DMA callback */
+static void dma_callback(const struct device *dev, void *user_data, uint32_t channel, int status)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+    ARG_UNUSED(channel);
+
+    static int64_t start_time = 0;
+
+    if (status == 0) {
+        if (start_time == 0) {
+            start_time = k_uptime_get();   // mark when DMA started
+        }
+
+        printk("DMA transfer completed, processing buffer...\n");
+
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+            int32_t mv = (dma_buffer[i] * 1650) / 4095;
+            if (BUFFER_SIZE < 100)
+            {
+                printk("Sample[%d]: %dmV (raw: %d)\n", i, mv, dma_buffer[i]);
+            }
+        }
+
+        /* --- Print rate immediately after first buffer --- */
+        int64_t end_time = k_uptime_get();
+        int64_t elapsed_ms = end_time - start_time;
+
+        if (elapsed_ms > 0) {
+            uint32_t rate = (BUFFER_SIZE * 1000ULL) / elapsed_ms;
+            printk("Measured sampling rate (first buffer): %u samples/sec\n", rate);
+        }
+
+    } else {
+        printk("DMA error: %d\n", status);
+    }
+}
+
+int setup_dma(void)
+{
+    int ret;
+
+    dma_dev = DEVICE_DT_GET(DMA_NODE);
+    if (!device_is_ready(dma_dev)) {
+        printk("DMA device not ready\n");
+        return -1;
+    }
+
+    static struct dma_block_config dma_block_cfg = {
+        .block_size = sizeof(dma_buffer),
+        .source_address = (uint32_t)&ADC1->DR, // ADC1 data register
+        .dest_address = (uint32_t)dma_buffer,
+        .dest_addr_adj = DMA_ADDR_ADJ_INCREMENT, // increment buffer
+        .source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
+    };
+
+    static struct dma_config dma_cfg = {
+        .dma_slot = 0,
+        .channel_direction = PERIPHERAL_TO_MEMORY,
+        .complete_callback_en = 1,
+        .source_data_size = 2,  // 16-bit
+        .dest_data_size = 2,
+        .source_burst_length = 1,
+        .dest_burst_length = 1,
+        .dma_callback = dma_callback,
+        .block_count = 1,
+        .head_block = &dma_block_cfg,
+    };
+
+    ret = dma_config(dma_dev, 0, &dma_cfg);
+    if (ret < 0) {
+        printk("DMA config failed: %d\n", ret);
+        return ret;
+    }
+
+    ret = dma_start(dma_dev, 0);
+    if (ret < 0) {
+        printk("DMA start failed: %d\n", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/* Low-level ADC + DMA continuous mode setup */
+static void adc_dma_hardware_setup(void)
+{
+    /* Enable continuous conversion, DMA mode, and keep DMA requests alive */
+    ADC1->CR2 |= ADC_CR2_CONT;   // continuous conversion mode
+    ADC1->CR2 |= ADC_CR2_DMA;    // DMA mode enabled
+    ADC1->CR2 |= ADC_CR2_DDS;    // DMA requests issued continuously
+
+    /* Turn ADC on */
+    ADC1->CR2 |= ADC_CR2_ADON;
+
+    /* Start conversions */
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+}
+
+int main(void)
+{
+    printk("Starting ADC with DMA test...\n");
+
+    adc_dev = DEVICE_DT_GET(ADC_NODE);
+    if (!device_is_ready(adc_dev)) {
+        printk("ADC device not ready\n");
+        return 0;
+    }
+    printk("ADC device: %s\n", adc_dev->name);
+
+    /* Configure ADC channel */
+    struct adc_channel_cfg ch_cfg = {
+        .gain = ADC_GAIN_1,
+        .reference = ADC_REF_INTERNAL,
+        .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+        .channel_id = 0,   // PA0 = ADC1_IN0
+        .differential = 0,
+    };
+
+    if (adc_channel_setup(adc_dev, &ch_cfg) != 0) {
+        printk("ADC channel setup failed\n");
+        return 0;
+    }
+
+    /* DMA + ADC setup */
+    setup_dma();
+    adc_dma_hardware_setup();
+
+    printk("ADC + DMA continuous sampling started!\n");
+
+    while (1) {
+        k_sleep(K_SECONDS(1));  // keep main thread alive
+    }
+}
