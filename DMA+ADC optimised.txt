@@ -1,0 +1,243 @@
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/dma.h>
+#include <zephyr/sys/printk.h>
+#include <stdio.h>
+#include <inttypes.h>
+#include <stm32f7xx.h>
+
+#define ADC_NODE DT_ALIAS(adc0)
+static const struct device *adc_dev = DEVICE_DT_GET(ADC_NODE);
+
+#define DMA_NODE DT_NODELABEL(dma2)
+static const struct device *dma_dev;
+
+#define TARGET_SAMPLE_RATE 5000000  // 5 MSPS
+#define VREF_MV 1650
+#define BUFFER_SIZE 4368
+
+/* DMA buffer (must be aligned) */
+static __aligned(32) int16_t dma_buffer[BUFFER_SIZE];
+static volatile size_t samples_captured = 0;
+static volatile int64_t dma_start_time = 0;
+static volatile bool capture_complete = false;
+
+/* DMA callback */
+static void dma_callback(const struct device *dev, void *user_data, 
+                        uint32_t channel, int status)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+    ARG_UNUSED(channel);
+
+    if (status == 0) {
+        samples_captured = BUFFER_SIZE;
+        capture_complete = true;
+        
+        int64_t end_time = k_uptime_get();
+        int64_t elapsed_us = (end_time - dma_start_time) * 1000LL;
+        
+        if (elapsed_us > 0) {
+            uint32_t actual_rate = (BUFFER_SIZE * 1000000ULL) / elapsed_us;
+            printk("\n=== DMA Transfer Complete ===\n");
+            printk("Samples captured: %zu\n", samples_captured);
+            printk("Elapsed time: %lld us\n", elapsed_us);
+            printk("Actual sampling rate: %u samples/sec (%.2f MSPS)\n", 
+                   actual_rate, actual_rate / 1000000.0);
+            
+            if (actual_rate >= 4900000 && actual_rate <= 5100000) {
+                printk("✓ Target 5 MSPS achieved!\n");
+            } else {
+                printk("⚠ Adjust ADC prescaler for 5 MSPS\n");
+            }
+        }
+    } else {
+        printk("DMA error: %d\n", status);
+    }
+}
+
+int setup_dma(void)
+{
+    int ret;
+
+    dma_dev = DEVICE_DT_GET(DMA_NODE);
+    if (!device_is_ready(dma_dev)) {
+        printk("DMA device not ready\n");
+        return -1;
+    }
+
+    static struct dma_block_config dma_block_cfg = {
+        .block_size = sizeof(dma_buffer),
+        .source_address = (uint32_t)&ADC1->DR,
+        .dest_address = (uint32_t)dma_buffer,
+        .dest_addr_adj = DMA_ADDR_ADJ_INCREMENT,
+        .source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
+    };
+
+    static struct dma_config dma_cfg = {
+        .dma_slot = 0,
+        .channel_direction = PERIPHERAL_TO_MEMORY,
+        .complete_callback_en = 1,
+        .source_data_size = 2,
+        .dest_data_size = 2,
+        .source_burst_length = 1,
+        .dest_burst_length = 1,
+        .dma_callback = dma_callback,
+        .block_count = 1,
+        .head_block = &dma_block_cfg,
+    };
+
+    ret = dma_config(dma_dev, 0, &dma_cfg);
+    if (ret < 0) {
+        printk("DMA config failed: %d\n", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/* Optimized ADC + DMA setup for 5 MSPS - STM32F7 specific */
+static void adc_dma_hardware_setup(void)
+{
+    printk("Configuring ADC for high-speed sampling...\n");
+    
+    // Ensure ADC is disabled before configuration
+    ADC1->CR2 &= ~ADC_CR2_ADON;
+    k_busy_wait(10);
+    
+    // Reset configuration registers
+    ADC1->CR1 = 0;
+    ADC1->CR2 = 0;
+    
+    // Configure for high speed operation
+    ADC1->CR2 |= ADC_CR2_CONT;   // Continuous mode
+    ADC1->CR2 |= ADC_CR2_DMA;    // DMA enabled  
+    ADC1->CR2 |= ADC_CR2_DDS;    // DMA requests continuous
+    
+    // Set sample time to minimum for maximum speed (3 cycles)
+    ADC1->SMPR2 &= ~ADC_SMPR2_SMP0_Msk;
+    ADC1->SMPR2 |= (0b000 << ADC_SMPR2_SMP0_Pos); // 3 cycles (minimum)
+    
+    // Single channel sequence
+    ADC1->SQR1 = 0; // 1 conversion in sequence
+    ADC1->SQR3 = 0; // Channel 0  
+    
+    // Enable ADC
+    ADC1->CR2 |= ADC_CR2_ADON;
+    k_busy_wait(10);
+    
+    // FIX: STM32F7 uses different calibration method
+    // Enable ADC voltage regulator
+    ADC1->CR2 &= ~ADC_CR2_ADON;
+    k_busy_wait(10);
+    ADC1->CR2 |= ADC_CR2_ADON;
+    k_busy_wait(10);
+    
+    printk("ADC configured and ready\n");
+}
+
+void start_sampling(void)
+{
+    samples_captured = 0;
+    capture_complete = false;
+    dma_start_time = k_uptime_get();
+    
+    // Start DMA first
+    int ret = dma_start(dma_dev, 0);
+    if (ret < 0) {
+        printk("DMA start failed: %d\n", ret);
+        return;
+    }
+    
+    // Then start ADC conversions
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+    printk("Sampling started...\n");
+}
+
+void process_captured_data(void)
+{
+    if (samples_captured > 0) {
+        printk("\n=== Processing Captured Data ===\n");
+        
+        int32_t sum = 0;
+        int16_t min_val = INT16_MAX;
+        int16_t max_val = INT16_MIN;
+        
+        for (size_t i = 0; i < 10 && i < samples_captured; i++) {
+            sum += dma_buffer[i];
+            if (dma_buffer[i] < min_val) min_val = dma_buffer[i];
+            if (dma_buffer[i] > max_val) max_val = dma_buffer[i];
+            
+            if (i < 5) {
+                printk("Sample[%d]: raw=%d, mV=%d\n", 
+                       i, dma_buffer[i], (dma_buffer[i] * VREF_MV) / 4095);
+            }
+        }
+        
+        printk("Signal range: %d to %d\n", min_val, max_val);
+        printk("First 10 samples average: %d\n", sum / 10);
+        
+        samples_captured = 0;
+    }
+}
+
+int main(void)
+{
+    printk("\n*** ADC + DMA 5 MSPS System ***\n");
+    printk("Buffer size: %d samples\n", BUFFER_SIZE);
+    printk("Expected duration: %.3f ms\n", 
+           (double)BUFFER_SIZE / TARGET_SAMPLE_RATE * 1000);
+
+    // Check ADC device
+    if (!device_is_ready(adc_dev)) {
+        printk("ADC device not ready\n");
+        return 0;
+    }
+    printk("ADC device: %s\n", adc_dev->name);
+
+    // Configure ADC channel
+    struct adc_channel_cfg ch_cfg = {
+        .gain = ADC_GAIN_1,
+        .reference = ADC_REF_INTERNAL,
+        .acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_TICKS, 3),
+        .channel_id = 0,
+        .differential = 0,
+    };
+
+    if (adc_channel_setup(adc_dev, &ch_cfg) != 0) {
+        printk("ADC channel setup failed\n");
+        return 0;
+    }
+
+    // DMA setup
+    if (setup_dma() != 0) {
+        printk("DMA setup failed\n");
+        return 0;
+    }
+    
+    // Hardware ADC+DMA configuration
+    adc_dma_hardware_setup();
+
+    printk("\n=== System Ready - Starting automatic sampling ===\n");
+
+    int capture_count = 0;
+    
+    while (1) {
+        printk("\n--- Capture #%d ---\n", ++capture_count);
+        
+        start_sampling();
+        
+        // Wait for completion
+        while (!capture_complete) {
+            k_sleep(K_MSEC(1));
+        }
+        
+        // Process data
+        process_captured_data();
+        
+        // Wait before next capture
+        k_sleep(K_SECONDS(2));
+    }
+    
+    return 0;
+}

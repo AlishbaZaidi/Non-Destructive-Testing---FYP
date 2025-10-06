@@ -1,0 +1,120 @@
+#!/usr/bin/env python
+import serial
+import serial.tools.list_ports
+import matplotlib.pyplot as plt
+import re
+import sys
+import time
+import signal
+
+# -------- CONFIG ----------
+SERIAL_PORT = 'COM8'      # <-- change to your COM port, e.g. 'COM5'
+BAUDRATE = 115200
+NUM_SAMPLES = 200
+Y_LIMIT = (0, 100)       # mV range
+SIGNAL_NAMES = ["CH0", "CH1"]
+# --------------------------
+
+plot_styles = ['r.-','b.-','g.-','m.-','c.-','y.-','k.-']
+csv_pattern = re.compile(r'^\s*-?\d+(?:\s*,\s*-?\d+)+\s*$')
+
+# open serial port
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+except Exception as e:
+    print("Could not open serial port:", e)
+    sys.exit(1)
+
+# prepare plot
+plt.ion()
+fig, ax = plt.subplots()
+ax.set_ylim(Y_LIMIT)
+ax.set_xlim(0, NUM_SAMPLES)
+ax.set_xlabel("Sample #")
+ax.set_ylabel("mV")
+ax.grid(True)
+
+time_ms = []
+cnt = 0
+all_signals = []
+lines = []
+
+# graceful stop flag via SIGINT (Ctrl+C)
+running = True
+def _sigint_handler(sig, frame):
+    global running
+    running = False
+signal.signal(signal.SIGINT, _sigint_handler)
+
+print("Opening serial:", SERIAL_PORT, "baud:", BAUDRATE)
+
+try:
+    while running:
+        raw = ser.readline().decode('utf-8', errors='replace').strip()
+        if not raw:
+            continue
+
+        # Only accept clean CSV numeric lines like: "149,73" or " 149 , 73 "
+        if csv_pattern.match(raw):
+            parts = [p.strip() for p in raw.split(',')]
+            try:
+                values = [int(float(p)) for p in parts]
+            except ValueError:
+                # not numeric after all
+                continue
+        else:
+            # ignore other lines (boot/info messages)
+            continue
+
+        # if number of channels changed, re-init storage and plot lines
+        if len(all_signals) != len(values):
+            all_signals = [[] for _ in range(len(values))]
+            # recreate plot lines
+            ax.clear()
+            ax.set_ylim(Y_LIMIT)
+            ax.set_xlabel("Sample #")
+            ax.set_ylabel("mV")
+            ax.grid(True)
+            lines = []
+            for i in range(len(all_signals)):
+                style = plot_styles[i % len(plot_styles)]
+                label = SIGNAL_NAMES[i] 
+                line, = ax.plot([], [], style, label=label)
+                lines.append(line)
+            ax.legend(loc='upper left')
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+            print("Detected", len(values), "channels")
+
+        # append values
+        for i, v in enumerate(values):
+            all_signals[i].append(v)
+
+        time_ms.append(cnt)
+        cnt += 1
+
+        # sliding window
+        if len(time_ms) > NUM_SAMPLES:
+            time_ms.pop(0)
+            for s in all_signals:
+                s.pop(0)
+
+        # update line data (synchronous)
+        for i, line in enumerate(lines):
+            line.set_data(time_ms, all_signals[i])
+
+        ax.set_xlim(max(0, cnt - NUM_SAMPLES), cnt)
+        fig.canvas.draw()         # synchronous draw
+        fig.canvas.flush_events()
+        time.sleep(0.001)
+
+except Exception as e:
+    print("Error:", e)
+
+finally:
+    try:
+        ser.close()
+    except Exception:
+        pass
+    plt.close('all')
+    print("Stopped cleanly — serial closed.")

@@ -1,0 +1,226 @@
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/dma.h>
+#include <zephyr/sys/printk.h>
+#include <stdio.h>
+#include <inttypes.h>
+#include <stm32f7xx.h>
+
+#define ADC_NODE DT_ALIAS(adc0)
+static const struct device *adc_dev = DEVICE_DT_GET(ADC_NODE);
+
+#define DMA_NODE DT_NODELABEL(dma2)
+static const struct device *dma_dev;
+
+#define TARGET_SAMPLE_RATE 5000000  // total 5 MSPS for both channels interleaved
+#define VREF_MV 1650
+#define BUFFER_SIZE 4368            // must be even for 2 channels
+
+/* DMA buffer (must be aligned) */
+static __aligned(32) int16_t dma_buffer[BUFFER_SIZE];
+static volatile size_t samples_captured = 0;
+static volatile int64_t dma_start_time = 0;
+static volatile bool capture_complete = false;
+
+/* DMA callback */
+static void dma_callback(const struct device *dev, void *user_data,
+                        uint32_t channel, int status)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+    ARG_UNUSED(channel);
+
+    if (status == 0) {
+        samples_captured = BUFFER_SIZE;
+        capture_complete = true;
+
+        int64_t end_time = k_uptime_get();
+        int64_t elapsed_us = (end_time - dma_start_time) * 1000LL;
+
+        if (elapsed_us > 0) {
+            uint32_t actual_rate = (BUFFER_SIZE * 1000000ULL) / elapsed_us;
+            printk("\n=== DMA Transfer Complete ===\n");
+            printk("Samples captured: %zu\n", samples_captured);
+            printk("Elapsed time: %lld us\n", elapsed_us);
+            printk("Actual sampling rate: %u samples/sec (%.2f MSPS total)\n",
+                   actual_rate, actual_rate / 1000000.0);
+        }
+    } else {
+        printk("DMA error: %d\n", status);
+    }
+}
+
+int setup_dma(void)
+{
+    int ret;
+
+    dma_dev = DEVICE_DT_GET(DMA_NODE);
+    if (!device_is_ready(dma_dev)) {
+        printk("DMA device not ready\n");
+        return -1;
+    }
+
+    static struct dma_block_config dma_block_cfg = {
+        .block_size = sizeof(dma_buffer),
+        .source_address = (uint32_t)&ADC1->DR,
+        .dest_address = (uint32_t)dma_buffer,
+        .dest_addr_adj = DMA_ADDR_ADJ_INCREMENT,
+        .source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
+    };
+
+    static struct dma_config dma_cfg = {
+        .dma_slot = 0,
+        .channel_direction = PERIPHERAL_TO_MEMORY,
+        .complete_callback_en = 1,
+        .source_data_size = 2,
+        .dest_data_size = 2,
+        .source_burst_length = 1,
+        .dest_burst_length = 1,
+        .dma_callback = dma_callback,
+        .block_count = 1,
+        .head_block = &dma_block_cfg,
+    };
+
+    ret = dma_config(dma_dev, 0, &dma_cfg);
+    if (ret < 0) {
+        printk("DMA config failed: %d\n", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/* Optimized ADC + DMA setup for 5 MSPS total - STM32F7 specific */
+static void adc_dma_hardware_setup(void)
+{
+    printk("Configuring ADC for high-speed sampling...\n");
+
+    ADC1->CR2 &= ~ADC_CR2_ADON;
+    k_busy_wait(10);
+
+    ADC1->CR1 = 0;
+    ADC1->CR2 = 0;
+
+    ADC1->CR2 |= ADC_CR2_CONT;   // Continuous mode
+    ADC1->CR2 |= ADC_CR2_DMA;    // DMA enabled
+    ADC1->CR2 |= ADC_CR2_DDS;    // DMA requests continuous
+
+    /* Sample time for both channels */
+    ADC1->SMPR2 &= ~(ADC_SMPR2_SMP0_Msk | ADC_SMPR2_SMP1_Msk);
+    ADC1->SMPR2 |= (0b000 << ADC_SMPR2_SMP0_Pos); // 3 cycles ch0
+    ADC1->SMPR2 |= (0b000 << ADC_SMPR2_SMP1_Pos); // 3 cycles ch1
+
+    /* Two conversions in the regular sequence */
+    ADC1->SQR1 = (1 << 20);  // L[3:0]=1 => 2 conversions total
+    ADC1->SQR3 = (0 << 0) | (1 << 5); // 1st = ch0, 2nd = ch1
+
+    /* Power up ADC */
+    ADC1->CR2 |= ADC_CR2_ADON;
+    k_busy_wait(10);
+
+    /* Re-enable after stabilization */
+    ADC1->CR2 &= ~ADC_CR2_ADON;
+    k_busy_wait(10);
+    ADC1->CR2 |= ADC_CR2_ADON;
+    k_busy_wait(10);
+
+    printk("ADC configured for 2 channels interleaved\n");
+}
+
+void start_sampling(void)
+{
+    samples_captured = 0;
+    capture_complete = false;
+    dma_start_time = k_uptime_get();
+
+    int ret = dma_start(dma_dev, 0);
+    if (ret < 0) {
+        printk("DMA start failed: %d\n", ret);
+        return;
+    }
+
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+    printk("Sampling started...\n");
+}
+
+/* This now streams two channels as CSV */
+void process_captured_data(void)
+{
+    if (samples_captured > 0) {
+        printk("\n=== Processing Captured Data ===\n");
+
+        // Each pair = ch0,ch1
+        for (size_t i = 0; i < samples_captured; i += 2) {
+            int16_t ch0 = dma_buffer[i];
+            int16_t ch1 = dma_buffer[i + 1];
+            printf("%d,%d\n", ch0, ch1);
+        }
+
+        samples_captured = 0;
+    }
+}
+
+int main(void)
+{
+    printk("\n*** ADC + DMA 5 MSPS System (2 channels interleaved) ***\n");
+    printk("Buffer size: %d samples (interleaved)\n", BUFFER_SIZE);
+    printk("Expected duration: %.3f ms\n",
+           (double)BUFFER_SIZE / TARGET_SAMPLE_RATE * 1000);
+
+    if (!device_is_ready(adc_dev)) {
+        printk("ADC device not ready\n");
+        return 0;
+    }
+    printk("ADC device: %s\n", adc_dev->name);
+
+    /* Configure both channels so GPIO/clock set up correctly */
+    struct adc_channel_cfg ch0_cfg = {
+        .gain = ADC_GAIN_1,
+        .reference = ADC_REF_INTERNAL,
+        .acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_TICKS, 3),
+        .channel_id = 0,
+        .differential = 0,
+    };
+    if (adc_channel_setup(adc_dev, &ch0_cfg) != 0) {
+        printk("ADC channel 0 setup failed\n");
+        return 0;
+    }
+
+    struct adc_channel_cfg ch1_cfg = {
+        .gain = ADC_GAIN_1,
+        .reference = ADC_REF_INTERNAL,
+        .acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_TICKS, 3),
+        .channel_id = 1,
+        .differential = 0,
+    };
+    if (adc_channel_setup(adc_dev, &ch1_cfg) != 0) {
+        printk("ADC channel 1 setup failed\n");
+        return 0;
+    }
+
+    if (setup_dma() != 0) {
+        printk("DMA setup failed\n");
+        return 0;
+    }
+
+    adc_dma_hardware_setup();
+
+    printk("\n=== System Ready - Starting automatic sampling ===\n");
+
+    int capture_count = 0;
+
+    while (1) {
+        printk("\n--- Capture #%d ---\n", ++capture_count);
+
+        start_sampling();
+
+        while (!capture_complete) {
+            k_sleep(K_MSEC(1));
+        }
+
+        process_captured_data();
+
+        k_sleep(K_SECONDS(2));
+    }
+    return 0;
+}
