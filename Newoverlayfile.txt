@@ -1,0 +1,18 @@
+/ {
+    aliases {
+        adc0 = &adc1;
+    };
+
+    zephyr,user {
+        io-channels = <&adc1 0>, <&adc1 1>;
+    };
+};
+
+&adc1 {
+    status = "okay";
+    st,adc-prescaler = <2>;
+};
+
+&dma2 {
+    status = "okay";
+};
