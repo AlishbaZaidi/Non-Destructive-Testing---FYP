@@ -1,0 +1,6 @@
+# PGA460 Echo Data Dump — corrected sample rate
+# Date          : 2026-03-27 10:32:53
+# FS_EDD        : 48031 Hz
+# Sample period : 20.82 µs
+# Speed of sound: 343.0 m/s
+# Blanking      : first 8 samples skipped
